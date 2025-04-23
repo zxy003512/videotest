@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>WebRTC 视频通话（房间+密码）</title>
+  <style>
+    body { font-family: sans-serif; background:#f2f2f2; margin:0; padding:0; }
+    #container { max-width:600px; margin:40px auto; padding:20px; background:#fff; box-shadow:0 0 8px rgba(0,0,0,.1); }
+    input,button{width:100%;box-sizing:border-box;margin:6px 0;padding:8px;font-size:14px;}
+    #status{height:1.2em;color:red;}
+    #videos{display:none;flex-direction:column;}
+    video{width:100%;background:#000;margin-top:10px;}
+    #hangupBtn{display:none;}
+  </style>
+</head>
+<body>
+  <div id="container">
+    <h2>WebRTC 视频通话（房间+密码）</h2>
+    <input id="roomInput" placeholder="房间号 (任意字符串)" />
+    <input id="passInput" type="password" placeholder="密码 (固定)" />
+    <button id="joinBtn">加入房间</button>
+    <div id="status"></div>
+    <div id="videos">
+      <video id="localVideo" autoplay muted></video>
+      <video id="remoteVideo" autoplay></video>
+    </div>
+    <button id="hangupBtn">挂断</button>
+  </div>
+
+  <script>
+  (function(){
+    // /ws 会被 Vercel 路由到 server.js
+    const serverUrl = (location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws';
+
+    const roomInput= document.getElementById('roomInput');
+    const passInput= document.getElementById('passInput');
+    const joinBtn  = document.getElementById('joinBtn');
+    const hangupBtn= document.getElementById('hangupBtn');
+    const statusDiv= document.getElementById('status');
+    const videosDiv= document.getElementById('videos');
+    const localVideo  = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+
+    let ws, pc, localStream, isInitiator;
+    const pcConfig = { iceServers:[{urls:'stun:stun.l.google.com:19302'}] };
+
+    joinBtn.onclick = async () => {
+      const room = roomInput.value.trim(), pw = passInput.value.trim();
+      if (!room||!pw) { statusDiv.textContent='房间号/密码不能为空';return; }
+      joinBtn.disabled = true;
+      statusDiv.textContent = '连接信令服务器…';
+      ws = new WebSocket(serverUrl);
+
+      ws.onopen = ()=> ws.send(JSON.stringify({type:'join',room,password:pw}));
+      ws.onmessage = async ({data})=>{
+        const msg = JSON.parse(data);
+        if (msg.type==='error') {
+          statusDiv.textContent = '错误：'+msg.reason;
+          joinBtn.disabled = false;
+          return;
+        }
+        if (msg.type==='joined') {
+          isInitiator = msg.initiator;
+          statusDiv.textContent = '获取本地媒体…';
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+              audio:true,
+              video:{width:{max:320},height:{max:240},frameRate:{max:15}}
+            });
+            localVideo.srcObject = localStream;
+            videosDiv.style.display = 'flex';
+            hangupBtn.style.display = 'block';
+            statusDiv.textContent = '建立 P2P…';
+            createPC();
+          } catch (e) {
+            statusDiv.textContent = '获取媒体失败：'+e;
+          }
+        }
+        if (msg.type==='signal') {
+          await handleSignal(msg.signal);
+        }
+      };
+      ws.onerror = e=> console.error(e);
+      ws.onclose = ()=> console.log('WS closed');
+    };
+
+    hangupBtn.onclick = ()=>{
+      pc&&pc.close();
+      ws&&ws.close();
+      resetUI();
+    };
+
+    function resetUI(){
+      statusDiv.textContent='';
+      joinBtn.disabled = false;
+      videosDiv.style.display = 'none';
+      hangupBtn.style.display = 'none';
+      localStream&&localStream.getTracks().forEach(t=>t.stop());
+      localVideo.srcObject = remoteVideo.srcObject = null;
+      pc=ws=localStream=null;
+    }
+
+    function createPC(){
+      pc = new RTCPeerConnection(pcConfig);
+      localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+      pc.onicecandidate = e=>{
+        e.candidate && ws.send(JSON.stringify({type:'signal',signal:{candidate:e.candidate}}));
+      };
+      pc.ontrack = e=>{
+        if (!remoteVideo.srcObject) remoteVideo.srcObject = e.streams[0];
+      };
+      if (isInitiator) {
+        pc.onnegotiationneeded = async ()=>{
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          // 限制视频码率为 250kbps
+          pc.getSenders().forEach(s=>{
+            if (s.track.kind==='video') {
+              const p = s.getParameters();
+              p.encodings=[{maxBitrate:250_000}];
+              s.setParameters(p);
+            }
+          });
+          ws.send(JSON.stringify({type:'signal',signal:{sdp:pc.localDescription}}));
+        };
+      }
+    }
+
+    async function handleSignal(sig){
+      if (sig.sdp) {
+        await pc.setRemoteDescription(sig.sdp);
+        if (sig.sdp.type==='offer') {
+          const ans = await pc.createAnswer();
+          await pc.setLocalDescription(ans);
+          pc.getSenders().forEach(s=>{
+            if (s.track.kind==='video') {
+              const p = s.getParameters();
+              p.encodings=[{maxBitrate:250_000}];
+              s.setParameters(p);
+            }
+          });
+          ws.send(JSON.stringify({type:'signal',signal:{sdp:pc.localDescription}}));
+        }
+      }
+      if (sig.candidate) {
+        await pc.addIceCandidate(sig.candidate).catch(console.warn);
+      }
+    }
+  })();
+  </script>
+</body>
+</html>
